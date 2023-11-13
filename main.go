@@ -57,6 +57,6 @@ func main() {
 	fmt.Printf("There are %d machines in the cluster\n", len(machines.Items))
 
 	for _, machine := range machines.Items {
-		fmt.Printf("  %s", machine.Name)
+		fmt.Printf("  %s\n", machine.Name)
 	}
 }
