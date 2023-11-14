@@ -94,6 +94,14 @@ func main() {
 	} else {
 		klog.Error("No value for Memory capacity, this should not happen.")
 	}
+
+	// TODO
+	// 1. get machinesets to create a list of possible machine sizes to create
+	// 2. add call to prediction service
+	// 3. calculate difference between predicted load and actual capacity
+	// 4. do something:
+	//   4.1 if predicted load > actual capacity then scale out
+	//   4.2 if predicted load < actual capacity then scale in
 }
 
 func sumQuantity(left, right resource.Quantity) resource.Quantity {
