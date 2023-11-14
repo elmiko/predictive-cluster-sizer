@@ -28,6 +28,7 @@ import (
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
+	"k8s.io/klog/v2"
 
 	machinev1beta1 "github.com/openshift/client-go/machine/clientset/versioned/typed/machine/v1beta1"
 )
@@ -43,6 +44,9 @@ func main() {
 	} else {
 		kubeconfig = flag.String("kubeconfig", "", "absolute path to the kubeconfig file")
 	}
+
+	klog.InitFlags(nil)
+
 	flag.Parse()
 
 	// use the current context in kubeconfig
@@ -61,27 +65,34 @@ func main() {
 	if err != nil {
 		panic(err.Error())
 	}
-	fmt.Printf("Found %d nodes in the cluster\n", len(nodes.Items))
+	klog.InfoS("Checking for total nodes in cluster", "nodes", len(nodes.Items))
 	computeNodes := []corev1.Node{}
 	for _, node := range nodes.Items {
 		if _, found := node.Labels[MASTER_NODE_LABEL]; !found {
 			computeNodes = append(computeNodes, node)
 		}
 	}
-	result := corev1.ResourceList{}
+	resourceTotals := corev1.ResourceList{}
 	for _, node := range computeNodes {
 		for resource, value := range node.Status.Capacity {
-			if current, ok := result[resource]; ok {
-				result[resource] = sumQuantity(current, value)
+			if current, ok := resourceTotals[resource]; ok {
+				resourceTotals[resource] = sumQuantity(current, value)
 			} else {
-				result[resource] = value
+				resourceTotals[resource] = value
 			}
 		}
 	}
-	fmt.Printf("%d compute nodes\n", len(computeNodes))
-	fmt.Printf("Compute node resources:\n")
-	for resource, value := range result {
-		fmt.Printf("- %s: %s\n", resource, value.String())
+
+	klog.InfoS("Filtering out compute nodes from total", "nodes", len(computeNodes))
+	if value, found := resourceTotals[corev1.ResourceCPU]; found {
+		klog.InfoS("CPU capacity for compute nodes", "value", value.String())
+	} else {
+		klog.Error("No value for CPU capacity, this should not happen.")
+	}
+	if value, found := resourceTotals[corev1.ResourceMemory]; found {
+		klog.InfoS("Memory resource capacity for compute nodes", "value", value.String())
+	} else {
+		klog.Error("No value for Memory capacity, this should not happen.")
 	}
 }
 
