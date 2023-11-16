@@ -19,7 +19,9 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"os"
 	"path/filepath"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -30,7 +32,16 @@ import (
 	"k8s.io/client-go/util/homedir"
 	"k8s.io/klog/v2"
 
+	machineapiv1beta1 "github.com/openshift/api/machine/v1beta1"
 	machinev1beta1 "github.com/openshift/client-go/machine/clientset/versioned/typed/machine/v1beta1"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
+
+	"k8s.io/apimachinery/pkg/runtime"
+
+	"k8s.io/apimachinery/pkg/labels"
+	metricsapi "k8s.io/metrics/pkg/apis/metrics"
+	metricsV1beta1api "k8s.io/metrics/pkg/apis/metrics/v1beta1"
+	metricsclientset "k8s.io/metrics/pkg/client/clientset/versioned"
 )
 
 const (
@@ -38,6 +49,7 @@ const (
 )
 
 func main() {
+
 	var kubeconfig *string
 	if home := homedir.HomeDir(); home != "" {
 		kubeconfig = flag.String("kubeconfig", filepath.Join(home, ".kube", "config"), "(optional) absolute path to the kubeconfig file")
@@ -72,24 +84,25 @@ func main() {
 			computeNodes = append(computeNodes, node)
 		}
 	}
-	resourceTotals := corev1.ResourceList{}
+
+	resourceCapacityTotals := corev1.ResourceList{}
 	for _, node := range computeNodes {
 		for resource, value := range node.Status.Capacity {
-			if current, ok := resourceTotals[resource]; ok {
-				resourceTotals[resource] = sumQuantity(current, value)
+			if current, ok := resourceCapacityTotals[resource]; ok {
+				resourceCapacityTotals[resource] = sumQuantity(current, value)
 			} else {
-				resourceTotals[resource] = value
+				resourceCapacityTotals[resource] = value
 			}
 		}
 	}
 
 	klog.InfoS("Filtering out compute nodes from total", "nodes", len(computeNodes))
-	if value, found := resourceTotals[corev1.ResourceCPU]; found {
+	if value, found := resourceCapacityTotals[corev1.ResourceCPU]; found {
 		klog.InfoS("CPU capacity for compute nodes", "value", value.String())
 	} else {
 		klog.Error("No value for CPU capacity, this should not happen.")
 	}
-	if value, found := resourceTotals[corev1.ResourceMemory]; found {
+	if value, found := resourceCapacityTotals[corev1.ResourceMemory]; found {
 		klog.InfoS("Memory resource capacity for compute nodes", "value", value.String())
 	} else {
 		klog.Error("No value for Memory capacity, this should not happen.")
@@ -102,6 +115,148 @@ func main() {
 	// 4. do something:
 	//   4.1 if predicted load > actual capacity then scale out
 	//   4.2 if predicted load < actual capacity then scale in
+
+	machineClientset, err := machinev1beta1.NewForConfig(config)
+	if err != nil {
+		panic(err.Error())
+	}
+
+	namespace := "openshift-machine-api"
+	machineSets, err := machineClientset.MachineSets(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		panic(err.Error())
+	}
+
+	// 1. We're gonna get the machineset, but assume the values for now
+	var useMachineSet *machineapiv1beta1.MachineSet
+	for _, machineset := range machineSets.Items {
+		useMachineSet = &machineset
+		break
+	}
+
+	var nodeCPU = resource.MustParse("4")
+	var nodeMemory = resource.MustParse("16Gi")
+	//var nodeCreationDelay = 8 * time.Minute
+
+	klog.InfoS("Each node we have has these resources", "cpu", nodeCPU.String(), "memory", nodeMemory.String())
+	totalMemory := resourceCapacityTotals[corev1.ResourceMemory]
+	totalCPU := resourceCapacityTotals[corev1.ResourceCPU]
+
+	// Memory here is in megabytes for easier prediction
+	predictedCPU, predictedMemory := predict(time.Now().Add(20*time.Minute).UTC(), totalCPU.MilliValue(), totalMemory.Value()/(1024*1024))
+
+	// See what the % change was just for fun
+	klog.Infof("Prediction: CPU: %d MEM: %d", predictedCPU, predictedMemory)
+	cpuDeltaPrc := float64(predictedCPU) / float64(totalCPU.MilliValue())
+	memoryDeltaPrc := float64(predictedMemory) / float64(totalMemory.Value()/(1024*1024))
+	klog.Infof("MEMPRC: %d%% CPUPRC: %d%%\t", int64(memoryDeltaPrc)*100, int64(cpuDeltaPrc)*100)
+
+	// Figure out how much CPU and memory we lack
+	cpuDelta := predictedCPU - totalCPU.MilliValue()
+	memoryDelta := predictedMemory - (totalMemory.Value() / (1024 * 1024))
+
+	klog.Infof("CPU Delta is %d", cpuDelta)
+	klog.Infof("Memory Delta is %d", memoryDelta)
+
+	klog.Infof("Each new node will have: CPU: %d MEM: %d", nodeCPU.MilliValue(), nodeMemory.Value()/(1024*1024))
+
+	// Figure out how many nodes that translates to using our node size from above
+	numNodeCpuDelta := cpuDelta / nodeCPU.MilliValue()
+	numNodeMemDelta := memoryDelta / (nodeMemory.Value() / (1024 * 1024))
+
+	klog.Infof("CPU thinks it needs %d more nodes ", numNodeCpuDelta)
+	klog.Infof("Memory thinks it needs %d more nodes", numNodeMemDelta)
+
+	// There can be nodes that are in progress so let's just count our compute nodes for now and ignore what the machienset has done
+	var currentNodes, desiredNodes int32
+	currentNodes = int32(len(computeNodes))
+	desiredNodes = currentNodes + int32(numNodeCpuDelta)
+
+	// If we need both more CPU and more Memory, make the hungriest one happy
+	if numNodeMemDelta > numNodeCpuDelta {
+		desiredNodes = currentNodes + int32(numNodeMemDelta)
+	}
+
+	klog.Infof("I want to scale machineset %s to %d desired nodes (currently %d)", useMachineSet.Name, desiredNodes, *useMachineSet.Spec.Replicas)
+
+	// TODO(jkyros): we can't just delete the nodes if they're ful, regardless of our prediction,
+	// so we need to check the current usage
+
+	metricsClient, err := metricsclientset.NewForConfig(config)
+	if err != nil {
+		panic(err.Error())
+	}
+	selector, err := labels.Parse("!node-role.kubernetes.io/master")
+	metrics, err := getNodeMetricsFromMetricsAPI(metricsClient, "", selector)
+	if err != nil {
+		panic(err.Error())
+	}
+
+	resourceUsageTotals := corev1.ResourceList{}
+	for _, node := range computeNodes {
+		// TODO(jkyros): eew, I know
+		for _, metric := range metrics.Items {
+			memory := metric.Usage[corev1.ResourceMemory]
+			cpu := metric.Usage[corev1.ResourceCPU]
+			if metric.Name == node.Name {
+				klog.Infof("Collecting usage %s %s %s", metric.Name, memory.String(), cpu.String())
+				for resource, value := range metric.Usage {
+					if current, ok := resourceUsageTotals[resource]; ok {
+						resourceUsageTotals[resource] = sumQuantity(current, value)
+					} else {
+						resourceUsageTotals[resource] = value
+					}
+
+				}
+			}
+		}
+	}
+
+	usedMemory := resourceUsageTotals[corev1.ResourceMemory]
+	usedCPU := resourceUsageTotals[corev1.ResourceCPU]
+
+	klog.Infof("Total usage CPU: %d MEM: %d", usedCPU.MilliValue(), usedMemory.Value()/(1024*1024))
+
+	// TODO(jkyros): we really need to look at the delta here, but we need to not scale below what we're using
+	if desiredNodes < currentNodes {
+		// If what we're using is more than predicted, and we were going to scale down
+		if usedCPU.MilliValue() > predictedCPU || usedMemory.Value()/(1024*1024) > predictedMemory {
+			klog.Infof("Resource consumption exceeds prediction, can't scale down yet")
+			os.Exit(0)
+		}
+	}
+
+	// TODO(jkyros): If we don't wait for the nodes to be ready, things get weird, e.g. something like this shows in our resource tally :
+	// ip-10-0-13-244.ec2.internal   NotReady                      worker                 46s   v1.28.3+4cbdd29
+	// ip-10-0-16-186.ec2.internal   Ready                         worker                 13m   v1.28.3+4cbdd29
+	// ip-10-0-17-100.ec2.internal   Ready                         control-plane,master   9h    v1.28.3+4cbdd29
+	// ip-10-0-21-160.ec2.internal   NotReady,SchedulingDisabled   worker                 38s   v1.28.3+4cbdd29
+	// ip-10-0-21-70.ec2.internal    Ready,SchedulingDisabled      worker                 14m   v1.28.3+4cbdd29
+	// ip-10-0-41-29.ec2.internal    Ready                         control-plane,master   9h    v1.28.3+4cbdd29
+	// ip-10-0-42-203.ec2.internal   Ready                         worker                 9h    v1.28.3+4cbdd29
+	// ip-10-0-43-226.ec2.internal   Ready                         worker                 53m   v1.28.3+4cbdd29
+	// ip-10-0-48-62.ec2.internal    Ready                         worker                 14m   v1.28.3+4cbdd29
+	// ip-10-0-5-106.ec2.internal    Ready,SchedulingDisabled      worker                 51s   v1.28.3+4cbdd29
+	// ip-10-0-50-89.ec2.internal    NotReady                      worker                 40s   v1.28.3+4cbdd29
+	// ip-10-0-54-130.ec2.internal   Ready                         control-plane,master   9h    v1.28.3+4cbdd29
+	// ip-10-0-56-141.ec2.internal   NotReady,SchedulingDisabled   worker                 49s   v1.28.3+4cbdd29
+	// ip-10-0-57-72.ec2.internal    Ready                         worker                 53m   v1.28.3+4cbdd29
+	// ip-10-0-61-86.ec2.internal    Ready                         worker                 62s   v1.28.3+4cbdd29
+
+	if currentNodes == desiredNodes {
+		klog.Infof("Machineset replicas is already set to %d", useMachineSet.Name, desiredNodes)
+	} else {
+		klog.Infof("Scaling machineset %s to %d desired nodes (currently %d ready %d)", useMachineSet.Name, desiredNodes, *useMachineSet.Spec.Replicas, useMachineSet.Status.ReadyReplicas)
+
+		// TODO(jkyros): Yeah, I know this isn't a proper reconciliation, someone could beat us
+		modifyMachineSet := useMachineSet.DeepCopy()
+		modifyMachineSet.Spec.Replicas = &desiredNodes
+		_, err = machineClientset.MachineSets(namespace).Update(context.TODO(), modifyMachineSet, metav1.UpdateOptions{})
+		if err != nil {
+			panic(err.Error())
+		}
+	}
+	print_machinesets(config)
 }
 
 func sumQuantity(left, right resource.Quantity) resource.Quantity {
@@ -127,4 +282,78 @@ func print_machines(config *restclient.Config) {
 	for _, machine := range machines.Items {
 		fmt.Printf("  %s\n", machine.Name)
 	}
+}
+
+func print_machinesets(config *restclient.Config) {
+	clientset, err := machinev1beta1.NewForConfig(config)
+	if err != nil {
+		panic(err.Error())
+	}
+
+	namespace := "openshift-machine-api"
+	machineSets, err := clientset.MachineSets(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		panic(err.Error())
+	}
+	fmt.Printf("There are %d machinesets in the cluster\n", len(machineSets.Items))
+	scheme := runtime.NewScheme()
+	scheme.AddKnownTypes(machineapiv1beta1.SchemeGroupVersion,
+		&machineapiv1beta1.AWSMachineProviderConfig{},
+	)
+	codecFactory := serializer.NewCodecFactory(scheme)
+	decoder := codecFactory.UniversalDecoder(machineapiv1beta1.GroupVersion)
+
+	for _, machineset := range machineSets.Items {
+		fmt.Printf("  %s\n", machineset.Name)
+		obj, err := runtime.Decode(decoder, machineset.Spec.Template.Spec.ProviderSpec.Value.Raw)
+		if err != nil {
+			panic(err.Error())
+		}
+		switch obj := obj.(type) {
+		case *machineapiv1beta1.AWSMachineProviderConfig:
+			var awsProviderConfig machineapiv1beta1.AWSMachineProviderConfig
+			awsProviderConfig = *obj
+			fmt.Printf("  - %s\n", awsProviderConfig.InstanceType)
+			// TODO(jkyros): I wonder if the cluster already know sthis:
+			//Instance Size 	vCPU 	Memory (GiB) 	Instance Storage (GB) 	Network Bandwidth (Gbps) 	EBS Bandwidth (Gbps)
+			//m6i.xlarge 	       4 	          16 	EBS-Only                           	Up to 12.5 	               Up to 10
+		}
+
+	}
+
+}
+
+func getNodeMetricsFromMetricsAPI(metricsClient metricsclientset.Interface, resourceName string, selector labels.Selector) (*metricsapi.NodeMetricsList, error) {
+	var err error
+	versionedMetrics := &metricsV1beta1api.NodeMetricsList{}
+	mc := metricsClient.MetricsV1beta1()
+	nm := mc.NodeMetricses()
+	if resourceName != "" {
+		m, err := nm.Get(context.TODO(), resourceName, metav1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+		versionedMetrics.Items = []metricsV1beta1api.NodeMetrics{*m}
+	} else {
+		versionedMetrics, err = nm.List(context.TODO(), metav1.ListOptions{LabelSelector: selector.String()})
+		if err != nil {
+			return nil, err
+		}
+	}
+	metrics := &metricsapi.NodeMetricsList{}
+	err = metricsV1beta1api.Convert_v1beta1_NodeMetricsList_To_metrics_NodeMetricsList(versionedMetrics, metrics, nil)
+	if err != nil {
+		return nil, err
+	}
+	return metrics, nil
+}
+
+// This is a dummy prediction function that just lets us rock it back and forth, we'll swap this in for a
+// proper prediction model/api call later
+func predict(t time.Time, currentCPU int64, currentMemory int64) (predictedCPU, predictedMemory int64) {
+	klog.Infof("Predicting for %d CPU and %d memory", currentCPU, currentMemory)
+	if currentCPU >= 36000 || currentMemory > 140000 {
+		return currentCPU / 2, currentMemory / 2
+	}
+	return 2 * currentCPU, 2 * currentMemory
 }
