@@ -16,11 +16,17 @@ limitations under the License.
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"mime/multipart"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -48,9 +54,13 @@ const (
 	MASTER_NODE_LABEL = "node-role.kubernetes.io/master"
 )
 
-func main() {
+var httpClient = &http.Client{Timeout: 10 * time.Second}
+var config *restclient.Config
+var kubeconfig *string
+var clientset *kubernetes.Clientset
 
-	var kubeconfig *string
+func main() {
+	var err error
 	if home := homedir.HomeDir(); home != "" {
 		kubeconfig = flag.String("kubeconfig", filepath.Join(home, ".kube", "config"), "(optional) absolute path to the kubeconfig file")
 	} else {
@@ -62,20 +72,40 @@ func main() {
 	flag.Parse()
 
 	// use the current context in kubeconfig
-	config, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
+	config, err = clientcmd.BuildConfigFromFlags("", *kubeconfig)
 	if err != nil {
-		panic(err.Error())
+
+		config, err = restclient.InClusterConfig()
+		if err != nil {
+			panic(err.Error())
+		}
 	}
 
 	// create the clientset
-	clientset, err := kubernetes.NewForConfig(config)
+	clientset, err = kubernetes.NewForConfig(config)
 	if err != nil {
 		panic(err.Error())
 	}
 
+	klog.Infof("Fitting model to sample data...")
+	for fit_model() != nil {
+		klog.Infof("Waiting for model predictor to be ready")
+		<-time.After(5 * time.Second)
+	}
+	for {
+		err := runScaler()
+		if err != nil {
+			klog.Errorf("There was an incident: %s", err)
+		}
+		<-time.After(30 * time.Second)
+	}
+
+}
+
+func runScaler() error {
 	nodes, err := clientset.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
-		panic(err.Error())
+		return err
 	}
 	klog.InfoS("Checking for total nodes in cluster", "nodes", len(nodes.Items))
 	computeNodes := []corev1.Node{}
@@ -118,13 +148,13 @@ func main() {
 
 	machineClientset, err := machinev1beta1.NewForConfig(config)
 	if err != nil {
-		panic(err.Error())
+		return err
 	}
 
 	namespace := "openshift-machine-api"
 	machineSets, err := machineClientset.MachineSets(namespace).List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
-		panic(err.Error())
+		return err
 	}
 
 	// 1. We're gonna get the machineset, but assume the values for now
@@ -143,7 +173,10 @@ func main() {
 	totalCPU := resourceCapacityTotals[corev1.ResourceCPU]
 
 	// Memory here is in megabytes for easier prediction
-	predictedCPU, predictedMemory := predict(time.Now().Add(20*time.Minute).UTC(), totalCPU.MilliValue(), totalMemory.Value()/(1024*1024))
+	predictedCPU, predictedMemory, err := predict(time.Now().Add(20*time.Minute).UTC(), totalCPU.MilliValue(), totalMemory.Value()/(1024*1024))
+	if err != nil {
+		return err
+	}
 
 	// See what the % change was just for fun
 	klog.Infof("Prediction: CPU: %d MEM: %d", predictedCPU, predictedMemory)
@@ -184,12 +217,12 @@ func main() {
 
 	metricsClient, err := metricsclientset.NewForConfig(config)
 	if err != nil {
-		panic(err.Error())
+		return err
 	}
 	selector, err := labels.Parse("!node-role.kubernetes.io/master")
 	metrics, err := getNodeMetricsFromMetricsAPI(metricsClient, "", selector)
 	if err != nil {
-		panic(err.Error())
+		return err
 	}
 
 	resourceUsageTotals := corev1.ResourceList{}
@@ -222,7 +255,6 @@ func main() {
 		// If what we're using is more than predicted, and we were going to scale down
 		if usedCPU.MilliValue() > predictedCPU || usedMemory.Value()/(1024*1024) > predictedMemory {
 			klog.Infof("Resource consumption exceeds prediction, can't scale down yet")
-			os.Exit(0)
 		}
 	}
 
@@ -244,7 +276,7 @@ func main() {
 	// ip-10-0-61-86.ec2.internal    Ready                         worker                 62s   v1.28.3+4cbdd29
 
 	if currentNodes == desiredNodes {
-		klog.Infof("Machineset replicas is already set to %d", useMachineSet.Name, desiredNodes)
+		klog.Infof("Machineset %s replicas is already set to %d", useMachineSet.Name, desiredNodes)
 	} else {
 		klog.Infof("Scaling machineset %s to %d desired nodes (currently %d ready %d)", useMachineSet.Name, desiredNodes, *useMachineSet.Spec.Replicas, useMachineSet.Status.ReadyReplicas)
 
@@ -253,10 +285,13 @@ func main() {
 		modifyMachineSet.Spec.Replicas = &desiredNodes
 		_, err = machineClientset.MachineSets(namespace).Update(context.TODO(), modifyMachineSet, metav1.UpdateOptions{})
 		if err != nil {
-			panic(err.Error())
+			return err
 		}
+		<-time.After(30 * time.Second)
+
 	}
 	print_machinesets(config)
+	return nil
 }
 
 func sumQuantity(left, right resource.Quantity) resource.Quantity {
@@ -266,34 +301,35 @@ func sumQuantity(left, right resource.Quantity) resource.Quantity {
 	return result
 }
 
-func print_machines(config *restclient.Config) {
+func print_machines(config *restclient.Config) error {
 	clientset, err := machinev1beta1.NewForConfig(config)
 	if err != nil {
-		panic(err.Error())
+		return err
 	}
 
 	namespace := "openshift-machine-api"
 	machines, err := clientset.Machines(namespace).List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
-		panic(err.Error())
+		return err
 	}
 	fmt.Printf("There are %d machines in the cluster\n", len(machines.Items))
 
 	for _, machine := range machines.Items {
 		fmt.Printf("  %s\n", machine.Name)
 	}
+	return nil
 }
 
-func print_machinesets(config *restclient.Config) {
+func print_machinesets(config *restclient.Config) error {
 	clientset, err := machinev1beta1.NewForConfig(config)
 	if err != nil {
-		panic(err.Error())
+		return err
 	}
 
 	namespace := "openshift-machine-api"
 	machineSets, err := clientset.MachineSets(namespace).List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
-		panic(err.Error())
+		return err
 	}
 	fmt.Printf("There are %d machinesets in the cluster\n", len(machineSets.Items))
 	scheme := runtime.NewScheme()
@@ -307,7 +343,7 @@ func print_machinesets(config *restclient.Config) {
 		fmt.Printf("  %s\n", machineset.Name)
 		obj, err := runtime.Decode(decoder, machineset.Spec.Template.Spec.ProviderSpec.Value.Raw)
 		if err != nil {
-			panic(err.Error())
+			return err
 		}
 		switch obj := obj.(type) {
 		case *machineapiv1beta1.AWSMachineProviderConfig:
@@ -320,7 +356,7 @@ func print_machinesets(config *restclient.Config) {
 		}
 
 	}
-
+	return nil
 }
 
 func getNodeMetricsFromMetricsAPI(metricsClient metricsclientset.Interface, resourceName string, selector labels.Selector) (*metricsapi.NodeMetricsList, error) {
@@ -348,9 +384,78 @@ func getNodeMetricsFromMetricsAPI(metricsClient metricsclientset.Interface, reso
 	return metrics, nil
 }
 
+type PredictionResponse struct {
+	CPU    int64 `json:"cpu"`
+	Memory int64 `json:"memory"`
+}
+
+// fit_model supplies data to the model esrver, for now
+// it's just the fake data generated by the generator
+func fit_model() error {
+	var err error
+	var dataDir = "data"
+	// Data generator dumps some stuff in files
+	// arranged by date, we just want to grab the one it spits out
+	var dataFile *os.File
+	for dataFile == nil {
+		files, err := os.ReadDir(dataDir)
+		if err != nil {
+			return err
+		}
+		for _, file := range files {
+			if strings.HasPrefix(file.Name(), "resource") && strings.HasSuffix(file.Name(), ".csv") {
+				dataFile, err = os.Open(filepath.Join(dataDir, file.Name()))
+				if err != nil {
+					return err
+				}
+				break
+			}
+		}
+	}
+	klog.Infof("Feeding datafile %s to the model fitter", dataFile.Name())
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	part, _ := writer.CreateFormFile("file", filepath.Base(dataFile.Name()))
+	io.Copy(part, dataFile)
+	writer.Close()
+
+	r, _ := http.NewRequest("POST", "http://localhost:5001/fit-model", body)
+	r.Header.Add("Content-Type", writer.FormDataContentType())
+	_, err = httpClient.Do(r)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func predict(t time.Time, currentCPU int64, currentMemory int64) (predictedCPU, predictedMemory int64, predictErr error) {
+
+	req, err := http.NewRequest("GET", "http://localhost:5001/predict", nil)
+
+	q := req.URL.Query()
+	q.Add("type", "resource")
+	q.Add("timestamp", t.Format("2006-01-02T15:04:05"))
+	req.URL.RawQuery = q.Encode()
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return 0, 0, err
+	}
+	klog.Infof("REQUESTING: %s", req.URL.String())
+
+	var prediction PredictionResponse
+	err = json.NewDecoder(resp.Body).Decode(&prediction)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	return prediction.CPU, prediction.Memory, nil
+}
+
 // This is a dummy prediction function that just lets us rock it back and forth, we'll swap this in for a
 // proper prediction model/api call later
-func predict(t time.Time, currentCPU int64, currentMemory int64) (predictedCPU, predictedMemory int64) {
+func predictfake(t time.Time, currentCPU int64, currentMemory int64) (predictedCPU, predictedMemory int64) {
+
 	klog.Infof("Predicting for %d CPU and %d memory", currentCPU, currentMemory)
 	if currentCPU >= 36000 || currentMemory > 140000 {
 		return currentCPU / 2, currentMemory / 2
